@@ -1,5 +1,6 @@
 import Cocoa
 import Foundation
+import IOKit.pwr_mgt
 
 // 配置（可用环境变量覆盖，便于测试）
 func envDouble(_ key: String, _ def: TimeInterval) -> TimeInterval {
@@ -11,9 +12,11 @@ func envInt(_ key: String, _ def: Int) -> Int {
     return def
 }
 
-let kIdleThreshold = envDouble("CACHEKEEPER_IDLE", 260)      // 真实活动后多少秒开始 ping
-var kPingInterval  = envDouble("CACHEKEEPER_INTERVAL", 260)  // 两次 ping 最小间隔（检测到 1h TTL 时自动改为 3000）
+let kIdleThreshold = envDouble("CACHEKEEPER_IDLE", 270)      // 真实活动后多少秒开始 ping（4:30）
+var kPingInterval  = envDouble("CACHEKEEPER_INTERVAL", 270)  // 两次 ping 最小间隔（检测到 1h TTL 时自动改为 3000）
 let kSessionWindow = envDouble("CACHEKEEPER_WINDOW", 1800)   // 只保活最近多少秒内活跃的会话
+let kKeepWindow    = envDouble("CACHEKEEPER_KEEPWINDOW", 3600) // 最后活动后只保活这么久（1 小时）
+var kCacheTtl      = envDouble("CACHEKEEPER_TTL", 300)       // 缓存有效期；超过即视为已过期，不再 ping
 let kMaxSessions   = envInt("CACHEKEEPER_MAX", 4)            // 最多同时保活几个会话
 let kTickInterval  = envDouble("CACHEKEEPER_TICK", 10)       // 扫描/检查周期（秒）
 let kPingTimeout   = envDouble("CACHEKEEPER_TIMEOUT", 150)   // 单次 ping 超时
@@ -72,6 +75,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var rows: [String: RowView] = [:]
     var rowOrder: [String] = []
     var timer: Timer?
+    var fsStream: FSEventStreamRef?
+    var sleepAssertion: IOPMAssertionID = 0
     var claudePath = ""
     var claudeVersion = ""
     var sessions: [String: SessionState] = [:]
@@ -88,6 +93,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         detectPromptCacheTtl()
         setupStatusItem()
         setupWindow()
+        scanSessions()
+        startWatching()
         resolveClaude()
         if ProcessInfo.processInfo.environment["CACHEKEEPER_NO_WINDOW"] != "1" {
             showWindow()
@@ -122,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
               let d = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               (d["promptCacheTtl"] as? String) == "1h" else { return }
         kPingInterval = 3000
+        kCacheTtl = 3600
         log("检测到 promptCacheTtl=1h，ping 间隔改为 50 分钟")
     }
 
@@ -166,12 +174,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - 定时检查
 
     @objc func tick() {
-        scanSessions()
         defer { scheduleTick() }
         guard !pingInFlight else { updateUI(); return }
         let now = Date()
         let candidates = sessions.values
-            .filter { canKeepAlive($0) && $0.nextPingAt <= now }
+            .filter { canKeepAlive($0) && cacheFresh($0, now: now) && $0.nextPingAt <= now }
             .sorted { $0.mtime > $1.mtime }
             .prefix(kMaxSessions)
         if ProcessInfo.processInfo.environment["CACHEKEEPER_DEBUG"] == "1" {
@@ -190,8 +197,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func automaticPingDate(for session: SessionState) -> Date? {
         guard kMaxSessions > 0, canKeepAlive(session) else { return nil }
-        let due = session.nextPingAt
-        return due < session.mtime.addingTimeInterval(kSessionWindow) ? due : nil
+        guard cacheFresh(session, now: Date()) else { return nil }
+        return session.nextPingAt
     }
 
     func scheduleTick() {
@@ -203,6 +210,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         RunLoop.main.add(next, forMode: .common)
     }
 
+    // MARK: - 文件监听（替代定时轮询，有变化才扫描）
+
+    func startWatching() {
+        let path = NSHomeDirectory() + "/.claude/projects"
+        var context = FSEventStreamContext(version: 0,
+                                           info: Unmanaged.passUnretained(self).toOpaque(),
+                                           retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info = info else { return }
+            let delegate = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
+            DispatchQueue.main.async {
+                delegate.scanSessions()
+                delegate.updateUI()
+                delegate.scheduleTick()
+            }
+        }
+        guard let stream = FSEventStreamCreate(kCFAllocatorDefault, callback, &context,
+                                               [path] as CFArray,
+                                               FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+                                               1.0,
+                                               0) else { return }
+        FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        FSEventStreamStart(stream)
+        fsStream = stream
+        log("已启动文件监听 \(path)")
+    }
+
     // MARK: - 会话扫描
 
     func scanSessions() {
@@ -211,15 +245,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let dirs = try? fm.contentsOfDirectory(atPath: root) else { return }
         let now = Date()
         var found: [String: SessionState] = [:]
+        let activeIDs = activeSessionIDs()
         for d in dirs {
             let dirPath = root + "/" + d
             guard let files = try? fm.contentsOfDirectory(atPath: dirPath) else { continue }
             for f in files where f.hasSuffix(".jsonl") {
                 let path = dirPath + "/" + f
                 guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let m = attrs[.modificationDate] as? Date,
-                      now.timeIntervalSince(m) < kSessionWindow else { continue }
+                      let m = attrs[.modificationDate] as? Date else { continue }
                 let id = String(f.dropLast(6))
+                // 仍开着的会话（有活动锁）不受 30 分钟窗口限制，可以一直保活
+                if now.timeIntervalSince(m) >= kSessionWindow && !activeIDs.contains(id) { continue }
                 if var old = sessions[id] {
                     if old.mtime != m { refreshUserTurn(&old) }
                     old.mtime = m
@@ -247,7 +283,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
         }
-        sessions = found
+        // 只保留仍可能活动的会话：有活动锁（Claude Code 正在运行）或 2 分钟内刚活跃
+        sessions = found.filter { id, s in
+            activeIDs.contains(id) || now.timeIntervalSince(s.mtime) < 120
+        }
+    }
+
+    func activeSessionIDs() -> Set<String> {
+        var ids = Set<String>()
+        let dir = NSHomeDirectory() + "/.claude/sessions"
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return ids }
+        for f in files where f.hasSuffix(".json") {
+            let path = dir + "/" + f
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let sid = obj["sessionId"] as? String else { continue }
+            if let pid = obj["pid"] as? Int, pid > 0, kill(pid_t(pid), 0) != 0 { continue }
+            ids.insert(sid)
+        }
+        return ids
     }
 
     func refreshUserTurn(_ session: inout SessionState) {
@@ -569,6 +623,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         logButton.frame = NSRect(x: 16, y: 14, width: 96, height: 32)
         content.addSubview(logButton)
 
+        let refreshButton = NSButton(title: "刷新", target: self, action: #selector(manualRefresh))
+        refreshButton.frame = NSRect(x: 120, y: 14, width: 64, height: 32)
+        content.addSubview(refreshButton)
+
         pingButton = NSButton(title: "立即保活", target: self, action: #selector(pingNow))
         pingButton.frame = NSRect(x: 510, y: 14, width: 112, height: 32)
         pingButton.autoresizingMask = [.minXMargin, .maxYMargin]
@@ -614,11 +672,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             guard let session = sessions[id], let row = rows[id] else { continue }
             updateRow(row, session: session, keptAlive: keptIDs.contains(id))
         }
+        setSleepBlock(!keptIDs.isEmpty)
+    }
+
+    /// 有保活任务时阻止系统睡眠；没有则释放，不影响正常休眠
+    func setSleepBlock(_ on: Bool) {
+        if on {
+            guard sleepAssertion == 0 else { return }
+            var id: IOPMAssertionID = 0
+            let result = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "Claude Cache Keepalive" as CFString,
+                &id)
+            if result == kIOReturnSuccess {
+                sleepAssertion = id
+                log("已阻止系统睡眠（有保活任务）")
+            }
+        } else if sleepAssertion != 0 {
+            IOPMAssertionRelease(sleepAssertion)
+            sleepAssertion = 0
+            log("已恢复系统睡眠策略（无保活任务）")
+        }
     }
 
     func canKeepAlive(_ session: SessionState) -> Bool {
         !claudeVersion.isEmpty && session.selected && !session.blocked &&
-            (session.version.isEmpty || session.version == claudeVersion)
+            (session.version.isEmpty || session.version == claudeVersion) &&
+            Date().timeIntervalSince(session.mtime) < kKeepWindow
+    }
+
+    /// 缓存是否可能仍然有效：以真实活动或上次 ping 中较晚者起算，超过 TTL 就视为已过期
+    func cacheFresh(_ s: SessionState, now: Date) -> Bool {
+        let last = max(s.mtime, s.lastPing ?? .distantPast)
+        return now.timeIntervalSince(last) < kCacheTtl
     }
 
     func countdown(to date: Date) -> String {
@@ -666,6 +753,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func makeSessionRow(id: String) -> RowView {
         let row = NSView()
+        row.identifier = NSUserInterfaceItemIdentifier(id)
+        let click = NSClickGestureRecognizer(target: self, action: #selector(rowClicked(_:)))
+        row.addGestureRecognizer(click)
         let checkbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleSession(_:)))
         checkbox.frame = NSRect(x: 8, y: 14, width: 20, height: 20)
         checkbox.identifier = NSUserInterfaceItemIdentifier(id)
@@ -707,7 +797,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         row.title.stringValue = title
         row.title.toolTip = title
         let project = (session.cwd as NSString).lastPathComponent
-        row.subtitle.stringValue = "\(project) · \(timeAgo(session.mtime))活跃"
+        var subtitleParts = [project]
+        if !session.model.isEmpty {
+            var m = session.model.components(separatedBy: "/").last ?? session.model
+            m = m.replacingOccurrences(of: "[1m]", with: "")
+            subtitleParts.append(m)
+        }
+        subtitleParts.append("\(timeAgo(session.mtime))活跃")
+        row.subtitle.stringValue = subtitleParts.joined(separator: " · ")
 
         let needsRestore = session.selected && session.blocked
         let status: String
@@ -720,7 +817,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         } else if claudeVersion.isEmpty {
             status = claudePath.isEmpty ? "未找到 Claude Code" : "等待 Claude Code"
         } else if !canKeepAlive(session) {
-            status = "版本不匹配"
+            if !session.version.isEmpty && session.version != claudeVersion {
+                status = "版本不匹配"
+            } else {
+                status = "已停止 · 超过 \(Int(kKeepWindow / 60)) 分钟未活动"
+            }
+        } else if !cacheFresh(session, now: Date()) {
+            status = "缓存已过期 · 等待新消息"
         } else if let due = automaticPingDate(for: session) {
             let next = pingInFlight && due <= Date() ? "等待发送" : "距下次保活 \(countdown(to: due))"
             status = keptAlive ? next : "排队中 · \(next)"
@@ -764,6 +867,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     // MARK: - 动作
 
+    @objc func rowClicked(_ g: NSClickGestureRecognizer) {
+        guard let view = g.view, let raw = view.identifier?.rawValue,
+              let session = sessions[raw] else { return }
+        let p = g.location(in: view)
+        if let cb = rows[raw]?.checkbox, cb.frame.contains(p) { return }
+        if let rb = rows[raw]?.restore, !rb.isHidden, rb.frame.contains(p) { return }
+        let on = !session.selected
+        sessions[raw]?.selected = on
+        UserDefaults.standard.set(on, forKey: "keep." + raw)
+        log("会话 \(raw.prefix(8)) \(on ? "勾选" : "取消勾选")（行点击）")
+        updateUI()
+        scheduleTick()
+    }
+
     @objc func toggleSession(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
         let on = sender.state == .on
@@ -799,6 +916,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         scheduleTick()
     }
 
+    @objc func manualRefresh() {
+        scanSessions()
+        updateUI()
+        log("手动刷新会话列表")
+    }
+
     @objc func openLog() {
         NSWorkspace.shared.open(logURL)
     }
@@ -813,7 +936,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func rotateLogIfNeeded() {
         let fm = FileManager.default
         guard let attrs = try? fm.attributesOfItem(atPath: logURL.path),
-              let size = attrs[.size] as? Int, size > 2_000_000 else { return }
+              let size = attrs[.size] as? Int, size > 1_000_000 else { return }
         try? fm.removeItem(atPath: logURL.path + ".1")
         try? fm.moveItem(atPath: logURL.path, toPath: logURL.path + ".1")
     }

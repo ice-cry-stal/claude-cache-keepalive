@@ -8,11 +8,13 @@ Claude Code's prompt cache has a 5-minute TTL. Reading a warm cache costs **0.1x
 
 ## What it does
 
-- Scans `~/.claude/projects/*/*.jsonl` every 10 seconds for sessions active in the last 30 minutes
-- For each **selected** session idle for 4 m 20 s, sends a minimal resume request every 4 m 20 s
+- Watches `~/.claude/projects` for file changes (event-driven, no polling) and lists only sessions that are **still open** (a Claude Code session lock exists) or were active in the last 2 minutes — closed conversations disappear automatically
+- Sends a minimal resume request to each **selected** session every **4 m 30 s**
+- Keeps a session warm for at most **1 hour after its last real activity** — past that, keepalive costs more than a cold rebuild, so it stops and waits for your next message
+- Skips pinging when the cache is already known to be expired (e.g. after system sleep), avoiding a paid full rebuild
+- Auto-pauses a session after two consecutive cache misses
+- Prevents system sleep while at least one keepalive task is active, and releases the assertion when none is left (display sleep is never blocked)
 - Never writes to your transcripts (`--no-session-persistence`)
-- Auto-pauses a session after two consecutive cache misses, so a broken prefix never burns money silently
-- Shows a countdown to the next ping and the last result; the per-session counter resets when you send a new message
 
 ## How it works
 
@@ -44,16 +46,17 @@ Menu bar (icon adapts to light/dark; shows a badge when sessions need restoring)
 
 Management window:
 
-- One row per session: checkbox, title, `project · last active`, and a status on the right (`保活中` / `排队中` / `未启用` / `已暂停`)
-- Kept-warm rows show `上次命中 · …`; auto-paused rows show `连续未命中` plus an inline 恢复 button
-- Footer: 打开日志 on the left, 立即保活 on the right; the window is resizable
+- One row per session: checkbox, title, `project · model · last active`, status on the right
+- Click anywhere in a row to toggle keepalive (the checkbox and restore button still work on their own)
+- Status values: `距下次保活 mm:ss` / `排队中` / `未启用` / `已暂停 · 连续未命中` / `已停止 · 超过 60 分钟未活动` / `缓存已过期 · 等待新消息`
+- Footer: 打开日志, 刷新 (manual rescan), 立即保活; the window is resizable
 
 ## Build
 
 Requires macOS 13+ and the Swift toolchain (Xcode Command Line Tools). No dependencies.
 
 ```bash
-swiftc -O -swift-version 5 -framework Cocoa main.swift -o CacheKeeper
+swiftc -O -swift-version 5 -framework Cocoa -framework IOKit main.swift -o CacheKeeper
 cp CacheKeeper CacheKeeper.app/Contents/MacOS/CacheKeeper
 codesign --force --deep --sign - CacheKeeper.app
 open CacheKeeper.app
@@ -63,24 +66,26 @@ The app runs as a menu bar item (`LSUIElement`), so it has no Dock icon. To rege
 
 ## Configuration
 
-Debug/build knobs via environment variables:
+Knobs via environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CACHEKEEPER_IDLE` | 260 | seconds of inactivity before a session becomes eligible |
-| `CACHEKEEPER_INTERVAL` | 260 | minimum seconds between pings per session |
-| `CACHEKEEPER_WINDOW` | 1800 | only sessions active within this window are listed |
+| `CACHEKEEPER_IDLE` | 270 | seconds of inactivity before a session becomes eligible (4 m 30 s) |
+| `CACHEKEEPER_INTERVAL` | 270 | minimum seconds between pings per session |
+| `CACHEKEEPER_KEEPWINDOW` | 3600 | stop keeping a session warm this long after its last real activity |
+| `CACHEKEEPER_TTL` | 300 | cache TTL; a session older than this is treated as expired and not pinged |
+| `CACHEKEEPER_WINDOW` | 1800 | listed-session window for sessions without a live lock |
 | `CACHEKEEPER_MAX` | 4 | max sessions kept warm at once |
-| `CACHEKEEPER_TICK` | 10 | scan/check interval |
+| `CACHEKEEPER_TICK` | 10 | scheduler check interval |
 | `CACHEKEEPER_TIMEOUT` | 150 | per-ping timeout |
 
-If `~/.claude/settings.json` contains `"promptCacheTtl": "1h"`, the ping interval automatically becomes 50 minutes.
+If `~/.claude/settings.json` contains `"promptCacheTtl": "1h"`, the ping interval automatically becomes 50 minutes and the TTL check 60 minutes.
 
-Logs: `~/Library/Logs/CacheKeeper.log`
+Logs: `~/Library/Logs/CacheKeeper.log` — rotates at 1 MB (current + one previous file).
 
 ## Caveats
 
-- Only sessions active within the last 30 minutes are considered (up to 10 listed, up to 4 kept warm)
+- Only sessions that are still open (Claude Code running) stay listed; closed conversations drop out within 2 minutes
 - The upstream must support prompt caching for hits to happen; a relay that rewrites requests may break prefix matching
 - Some third-party relays ignore `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, in which case a ping can still generate a few hundred output tokens
 - Keepalive economics: warm read = 0.1x input, cold rebuild = 1.25x (5m TTL) — worth it for pauses up to ~1 hour; with 1h TTL (2x write) the break-even is ~20 pings (~9 hours)
