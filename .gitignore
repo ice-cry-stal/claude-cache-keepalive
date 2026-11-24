@@ -1,0 +1,10 @@
+# build artifacts
+CacheKeeper
+CacheKeeper.app/
+*.icns
+icon_1024.png
+*.iconset/
+
+# misc
+*.log
+.DS_Store
