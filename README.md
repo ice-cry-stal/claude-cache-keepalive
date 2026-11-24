@@ -56,10 +56,10 @@ Management window:
 Requires macOS 13+ and the Swift toolchain (Xcode Command Line Tools). No dependencies.
 
 ```bash
-swiftc -O -swift-version 5 -framework Cocoa -framework IOKit main.swift -o CacheKeeper
-cp CacheKeeper CacheKeeper.app/Contents/MacOS/CacheKeeper
-codesign --force --deep --sign - CacheKeeper.app
-open CacheKeeper.app
+swiftc -O -swift-version 5 -framework Cocoa -framework IOKit main.swift -o ClaudeKeepalive
+cp ClaudeKeepalive "Claude保活工具.app/Contents/MacOS/ClaudeKeepalive"
+codesign --force --deep --sign - "Claude保活工具.app"
+open "Claude保活工具.app"
 ```
 
 The app runs as a menu bar item (`LSUIElement`), so it has no Dock icon. To regenerate the icon, run `swift gen_icon.swift`, then build the `.icns` with `iconutil`.
@@ -81,7 +81,7 @@ Knobs via environment variables:
 
 If `~/.claude/settings.json` contains `"promptCacheTtl": "1h"`, the ping interval automatically becomes 50 minutes and the TTL check 60 minutes.
 
-Logs: `~/Library/Logs/CacheKeeper.log` — rotates at 1 MB (current + one previous file).
+Logs: `~/Library/Logs/ClaudeKeepalive.log` — rotates at 1 MB (current + one previous file).
 
 ## Caveats
 

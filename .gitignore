@@ -1,6 +1,6 @@
 # build artifacts
-CacheKeeper
-CacheKeeper.app/
+ClaudeKeepalive
+Claude保活工具.app/
 *.icns
 icon_1024.png
 *.iconset/

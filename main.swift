@@ -91,7 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var pingInFlight: Bool { pingingSessionID != nil }
     var lastPingSucceeded = UserDefaults.standard.object(forKey: "lastPingSucceeded") as? Bool
     let rowHeight: CGFloat = 48
-    let logURL = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/CacheKeeper.log")
+    let logURL = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/ClaudeKeepalive.log")
 
     // MARK: - 生命周期
 
@@ -617,7 +617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menuPing.isEnabled = false
         menu.addItem(menuPing)
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "退出缓存保活", action: #selector(quit), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "退出 Claude保活工具", action: #selector(quit), keyEquivalent: "q"))
         for item in menu.items where item.action != nil { item.target = self }
         statusItem.menu = menu
         updateStatusIcon(needsRestore: false)
@@ -627,7 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 638, height: 414),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
                          backing: .buffered, defer: false)
-        w.title = "会话保活"
+        w.title = "Claude保活工具"
         w.isReleasedWhenClosed = false
         w.contentMinSize = NSSize(width: 440, height: 250)
         w.center()
@@ -764,7 +764,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func updateStatusIcon(needsRestore: Bool) {
-        let label = needsRestore ? "Claude Code 缓存保活，有会话待恢复" : "Claude Code 缓存保活"
+        let label = needsRestore ? "Claude保活工具，有会话待恢复" : "Claude保活工具"
         guard let button = statusItem.button, button.toolTip != label else { return }
         let symbol = needsRestore ? "bolt.badge.exclamationmark" : "bolt.heart.fill"
         let image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
