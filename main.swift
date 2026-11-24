@@ -20,6 +20,8 @@ var kCacheTtl      = envDouble("CACHEKEEPER_TTL", 300)       // 缓存有效期�
 let kMaxSessions   = envInt("CACHEKEEPER_MAX", 4)            // 最多同时保活几个会话
 let kTickInterval  = envDouble("CACHEKEEPER_TICK", 10)       // 扫描/检查周期（秒）
 let kPingTimeout   = envDouble("CACHEKEEPER_TIMEOUT", 150)   // 单次 ping 超时
+let kRetryDeadline = envDouble("CACHEKEEPER_RETRY_DEADLINE", 294) // 距上次缓存活动的最后发送时间（秒）
+let kMaxRetries    = envInt("CACHEKEEPER_MAX_RETRIES", 3)    // 失败后最多立即重试几次
 
 struct SessionState {
     let id: String
@@ -38,8 +40,13 @@ struct SessionState {
     var consecutiveMiss: Int = 0
     var blocked: Bool = false
     var selected: Bool = false
+    var retryAt: Date? = nil
+    var failCount: Int = 0
+    var lastSuccess: Date? = nil
+    var finalRetryDone: Bool = false
 
     var nextPingAt: Date {
+        if let retry = retryAt { return retry }
         let idleAt = mtime.addingTimeInterval(kIdleThreshold)
         guard let lastPing = lastPing else { return idleAt }
         return max(idleAt, lastPing.addingTimeInterval(kPingInterval))
@@ -178,7 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !pingInFlight else { updateUI(); return }
         let now = Date()
         let candidates = sessions.values
-            .filter { canKeepAlive($0) && cacheFresh($0, now: now) && $0.nextPingAt <= now }
+            .filter { canKeepAlive($0) && cacheFresh($0, now: now) && withinSendDeadline($0, now: now) && $0.nextPingAt <= now }
             .sorted { $0.mtime > $1.mtime }
             .prefix(kMaxSessions)
         if ProcessInfo.processInfo.environment["CACHEKEEPER_DEBUG"] == "1" {
@@ -197,7 +204,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func automaticPingDate(for session: SessionState) -> Date? {
         guard kMaxSessions > 0, canKeepAlive(session) else { return nil }
-        guard cacheFresh(session, now: Date()) else { return nil }
+        let now = Date()
+        guard cacheFresh(session, now: now) else { return nil }
+        guard withinSendDeadline(session, now: now) else { return nil }
         return session.nextPingAt
     }
 
@@ -309,6 +318,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         session.userTurn = turn
         session.pingCount = 0
         session.lastPingSucceeded = nil
+        session.finalRetryDone = false
+        session.failCount = 0
+        session.retryAt = nil
         UserDefaults.standard.removeObject(forKey: "pingCount." + session.id)
     }
 
@@ -476,7 +488,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             savePingHistory(s)
             updateUI()
         }
-        DispatchQueue.global().asyncAfter(deadline: .now() + kPingTimeout) {
+        // 超时不超过发送截止时间（294s）；最后补发至少给 30 秒机会
+        let lastTouch = max(s.mtime, s.lastSuccess ?? .distantPast)
+        let untilDeadline = kRetryDeadline - Date().timeIntervalSince(lastTouch)
+        let timeout = min(kPingTimeout, max(30, untilDeadline))
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
             if proc.isRunning {
                 self.log("ping 超时，终止子进程 \(id.prefix(8))")
                 proc.terminate()
@@ -543,6 +559,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             } else if read > 0 {
                 s.consecutiveMiss = 0
+                s.failCount = 0
+                s.retryAt = nil
+                s.lastSuccess = Date()
+                s.finalRetryDone = false
+            } else {
+                // 出错立即重试（最多 kMaxRetries 次）；到 294s 仍没回复则最后补发一次，再无果就停
+                s.failCount += 1
+                let now = Date()
+                let lastTouch = max(s.mtime, s.lastSuccess ?? .distantPast)
+                let deadline = lastTouch.addingTimeInterval(kRetryDeadline)
+                if now < deadline && s.failCount <= kMaxRetries {
+                    s.retryAt = now.addingTimeInterval(1)
+                    finalNote = "\(note)（立即重试 \(s.failCount)/\(kMaxRetries)）"
+                } else if !s.finalRetryDone {
+                    s.finalRetryDone = true
+                    s.retryAt = nil
+                    finalNote = "\(note)（已到最后时刻，补发一次）"
+                    sessions[id] = s
+                    pingingSessionID = nil
+                    log("[ping] \(id.prefix(8)) 到 \(Int(kRetryDeadline))s 未成功，最后补发一次")
+                    updateUI()
+                    scheduleTick()
+                    ping(id)
+                    return
+                } else {
+                    s.retryAt = nil
+                    finalNote = "\(note)（已停止发送，等下次活动）"
+                }
             }
             s.lastNote = finalNote
             sessions[id] = s
@@ -706,6 +750,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func cacheFresh(_ s: SessionState, now: Date) -> Bool {
         let last = max(s.mtime, s.lastPing ?? .distantPast)
         return now.timeIntervalSince(last) < kCacheTtl
+    }
+
+    /// 是否还在允许发送保活的时间窗内（距上次缓存活动 < 294 秒）
+    func withinSendDeadline(_ s: SessionState, now: Date) -> Bool {
+        let lastTouch = max(s.mtime, s.lastSuccess ?? .distantPast)
+        return now.timeIntervalSince(lastTouch) < kRetryDeadline
     }
 
     func countdown(to date: Date) -> String {
