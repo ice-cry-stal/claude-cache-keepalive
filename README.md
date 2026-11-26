@@ -8,7 +8,7 @@ Claude Code's prompt cache has a 5-minute TTL. Reading a warm cache costs **0.1x
 
 ## What it does
 
-- Watches `~/.claude/projects` for file changes (event-driven, no polling) and lists only sessions that are **still open** (a Claude Code session lock exists) or were active in the last 2 minutes — closed conversations disappear automatically
+- Watches transcripts under `~/.claude/projects` and locks under `~/.claude/sessions`. Ordinary transcript changes update only the affected sessions. The list shows sessions that are **still open** or were active in the last 2 minutes.
 - Sends a minimal resume request to each **selected** session every **4 m 30 s**
 - Keeps a session warm for at most **1 hour after its last real activity** — past that, keepalive costs more than a cold rebuild, so it stops and waits for your next message
 - Skips pinging when the cache is already known to be expired (e.g. after system sleep), avoiding a paid full rebuild
@@ -37,7 +37,7 @@ It does **not** patch Claude Code, inject anything, or modify any configuration.
 
 ## UI
 
-Menu bar (icon adapts to light/dark; shows a badge when sessions need restoring):
+The app opens in the menu bar. Choose **管理会话…** to open the management window. The icon adapts to light/dark and shows a badge when sessions need restoring.
 
 - Status line: `N 个会话保活中 · M 个待恢复` / `尚未选择会话`
 - 管理会话…
@@ -76,8 +76,9 @@ Knobs via environment variables:
 | `CACHEKEEPER_TTL` | 300 | cache TTL; a session older than this is treated as expired and not pinged |
 | `CACHEKEEPER_WINDOW` | 1800 | listed-session window for sessions without a live lock |
 | `CACHEKEEPER_MAX` | 4 | max sessions kept warm at once |
-| `CACHEKEEPER_TICK` | 10 | scheduler check interval |
+| `CACHEKEEPER_TICK` | unset | optional periodic scheduler check interval in seconds (defaults to deadline-based scheduling) |
 | `CACHEKEEPER_TIMEOUT` | 150 | per-ping timeout |
+| `CACHEKEEPER_NO_WINDOW` | 1 | set to `0` to open the management window at launch |
 
 If `~/.claude/settings.json` contains `"promptCacheTtl": "1h"`, the ping interval automatically becomes 50 minutes and the TTL check 60 minutes.
 

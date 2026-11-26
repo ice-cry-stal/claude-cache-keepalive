@@ -18,14 +18,16 @@ let kSessionWindow = envDouble("CACHEKEEPER_WINDOW", 1800)   // 只保活最近�
 let kKeepWindow    = envDouble("CACHEKEEPER_KEEPWINDOW", 3600) // 最后活动后只保活这么久（1 小时）
 var kCacheTtl      = envDouble("CACHEKEEPER_TTL", 300)       // 缓存有效期；超过即视为已过期，不再 ping
 let kMaxSessions   = envInt("CACHEKEEPER_MAX", 4)            // 最多同时保活几个会话
-let kTickInterval  = envDouble("CACHEKEEPER_TICK", 10)       // 扫描/检查周期（秒）
+let kDebugTicks = ProcessInfo.processInfo.environment["CACHEKEEPER_DEBUG"] == "1"
+let kTickInterval: TimeInterval? = kDebugTicks || ProcessInfo.processInfo.environment["CACHEKEEPER_TICK"] != nil
+    ? envDouble("CACHEKEEPER_TICK", 10) : nil
 let kPingTimeout   = envDouble("CACHEKEEPER_TIMEOUT", 150)   // 单次 ping 超时
 let kRetryDeadline = envDouble("CACHEKEEPER_RETRY_DEADLINE", 294) // 距上次缓存活动的最后发送时间（秒）
 let kMaxRetries    = envInt("CACHEKEEPER_MAX_RETRIES", 3)    // 失败后最多立即重试几次
 
 struct SessionState {
     let id: String
-    let jsonlPath: String
+    var jsonlPath: String
     let cwd: String
     let version: String
     var title: String
@@ -68,9 +70,10 @@ final class SessionListView: NSView {
     override var isFlipped: Bool { true }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var window: NSWindow!
+    var windowFrame: NSRect?
     var summaryLabel: NSTextField!
     var emptyLabel: NSTextField!
     var pingButton: NSButton!
@@ -82,16 +85,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var rows: [String: RowView] = [:]
     var rowOrder: [String] = []
     var timer: Timer?
+    var refreshTimer: Timer?
+    var menuIsOpen = false
     var fsStream: FSEventStreamRef?
     var sleepAssertion: IOPMAssertionID = 0
     var claudePath = ""
     var claudeVersion = ""
     var sessions: [String: SessionState] = [:]
+    var activeIDs = Set<String>()
     var pingingSessionID: String?
     var pingInFlight: Bool { pingingSessionID != nil }
     var lastPingSucceeded = UserDefaults.standard.object(forKey: "lastPingSucceeded") as? Bool
     let rowHeight: CGFloat = 48
     let logURL = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/ClaudeKeepalive.log")
+    let claudeRoot: String = {
+        let path = NSHomeDirectory() + "/.claude"
+        guard let resolved = realpath(path, nil) else { return path }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }()
+    var projectsRoot: String { claudeRoot + "/projects" }
+    var locksRoot: String { claudeRoot + "/sessions" }
 
     // MARK: - 生命周期
 
@@ -99,17 +113,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         rotateLogIfNeeded()
         detectPromptCacheTtl()
         setupStatusItem()
-        setupWindow()
-        scanSessions()
         startWatching()
+        scanSessions()
         resolveClaude()
-        if ProcessInfo.processInfo.environment["CACHEKEEPER_NO_WINDOW"] != "1" {
+        if ProcessInfo.processInfo.environment["CACHEKEEPER_NO_WINDOW"] == "0" {
             showWindow()
         }
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(workspaceDidWake(_:)),
+                                                           name: NSWorkspace.didWakeNotification, object: nil)
+        updateUI()
         scheduleTick()
-        // 界面时间文本每秒刷新（不重新扫描）
-        let refresh = Timer(timeInterval: 1, target: self, selector: #selector(updateUI), userInfo: nil, repeats: true)
-        RunLoop.main.add(refresh, forMode: .common)
         log("启动: claude 路径解析中")
     }
 
@@ -121,11 +134,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        // 窗口关闭不退出，继续在菜单栏保活
+        windowFrame = window?.frame
+        window = nil
+        summaryLabel = nil
+        emptyLabel = nil
+        pingButton = nil
+        scrollView = nil
+        docView = nil
+        rows.removeAll()
+        rowOrder.removeAll()
+        updateRefreshTimer()
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        updateRefreshTimer()
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        updateUI()
+        updateRefreshTimer()
     }
 
     func windowDidResize(_ notification: Notification) {
         updateUI()
+    }
+
+    func applicationDidHide(_ notification: Notification) {
+        updateRefreshTimer()
+    }
+
+    func applicationDidUnhide(_ notification: Notification) {
+        updateUI()
+        updateRefreshTimer()
+    }
+
+    @objc func workspaceDidWake(_ notification: Notification) {
+        DispatchQueue.main.async { self.tick() }
     }
 
     /// 若 Claude Code 开启了 1h prompt cache TTL，ping 间隔放宽到 50 分钟
@@ -182,13 +226,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func tick() {
         defer { scheduleTick() }
-        guard !pingInFlight else { updateUI(); return }
         let now = Date()
+        pruneSessions(now: now)
+        guard !pingInFlight else { updateUI(); return }
         let candidates = sessions.values
             .filter { canKeepAlive($0) && cacheFresh($0, now: now) && withinSendDeadline($0, now: now) && $0.nextPingAt <= now }
             .sorted { $0.mtime > $1.mtime }
             .prefix(kMaxSessions)
-        if ProcessInfo.processInfo.environment["CACHEKEEPER_DEBUG"] == "1" {
+        if kDebugTicks {
             log("tick: sessions=\(sessions.count) eligible=\(candidates.count) ver=\(claudeVersion)")
         }
         if let next = candidates.first {
@@ -205,16 +250,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func automaticPingDate(for session: SessionState) -> Date? {
         guard kMaxSessions > 0, canKeepAlive(session) else { return nil }
         let now = Date()
-        guard cacheFresh(session, now: now) else { return nil }
-        guard withinSendDeadline(session, now: now) else { return nil }
-        return session.nextPingAt
+        let due = max(now, session.nextPingAt)
+        guard due.timeIntervalSince(session.mtime) < kKeepWindow,
+              cacheFresh(session, now: due), withinSendDeadline(session, now: due) else { return nil }
+        return due
     }
 
     func scheduleTick() {
         timer?.invalidate()
-        let dueIn = pingInFlight ? nil : nextAutoPingDate()?.timeIntervalSinceNow
-        let delay = min(kTickInterval, max(0.05, dueIn ?? kTickInterval))
-        let next = Timer(timeInterval: delay, target: self, selector: #selector(tick), userInfo: nil, repeats: false)
+        timer = nil
+        let now = Date()
+        var deadlines = [Date]()
+        if !pingInFlight, let nextPing = nextAutoPingDate() { deadlines.append(nextPing) }
+        for session in sessions.values {
+            if !activeIDs.contains(session.id) {
+                deadlines.append(session.mtime.addingTimeInterval(min(kSessionWindow, 120)))
+            }
+            if canKeepAlive(session) {
+                deadlines.append(session.mtime.addingTimeInterval(kKeepWindow))
+            }
+        }
+        if let interval = kTickInterval { deadlines.append(now.addingTimeInterval(interval)) }
+        guard let deadline = deadlines.min() else { return }
+        let next = Timer(timeInterval: max(0.05, deadline.timeIntervalSinceNow), target: self,
+                         selector: #selector(tick), userInfo: nil, repeats: false)
         timer = next
         RunLoop.main.add(next, forMode: .common)
     }
@@ -222,85 +281,150 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     // MARK: - 文件监听（替代定时轮询，有变化才扫描）
 
     func startWatching() {
-        let path = NSHomeDirectory() + "/.claude/projects"
         var context = FSEventStreamContext(version: 0,
                                            info: Unmanaged.passUnretained(self).toOpaque(),
                                            retain: nil, release: nil, copyDescription: nil)
-        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+        let callback: FSEventStreamCallback = { _, info, count, eventPaths, flags, _ in
             guard let info = info else { return }
             let delegate = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
-            DispatchQueue.main.async {
-                delegate.scanSessions()
-                delegate.updateUI()
-                delegate.scheduleTick()
-            }
+            let paths = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue() as NSArray
+            delegate.handleSessionEvents(paths, flags: UnsafeBufferPointer(start: flags, count: count))
         }
         guard let stream = FSEventStreamCreate(kCFAllocatorDefault, callback, &context,
-                                               [path] as CFArray,
+                                               [claudeRoot] as CFArray,
                                                FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
                                                1.0,
-                                               0) else { return }
-        FSEventStreamScheduleWithRunLoop(stream, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        FSEventStreamStart(stream)
+                                               FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents |
+                                                                       kFSEventStreamCreateFlagUseCFTypes)) else { return }
+        FSEventStreamSetDispatchQueue(stream, DispatchQueue.main)
+        guard FSEventStreamStart(stream) else {
+            FSEventStreamInvalidate(stream)
+            FSEventStreamRelease(stream)
+            return
+        }
         fsStream = stream
-        log("已启动文件监听 \(path)")
+        log("已启动文件监听 \(claudeRoot)")
+    }
+
+    func handleSessionEvents(_ paths: NSArray, flags: UnsafeBufferPointer<FSEventStreamEventFlags>) {
+        var changedTranscripts = Set<String>()
+        var locksChanged = false
+        var needsRescan = false
+        let projectsPrefix = projectsRoot + "/"
+        let locksPrefix = locksRoot + "/"
+        let directoryChanges = FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated |
+                                                     kFSEventStreamEventFlagItemRemoved |
+                                                     kFSEventStreamEventFlagItemRenamed)
+        for (index, eventPath) in paths.enumerated() {
+            guard let path = eventPath as? String else { continue }
+            let event = flags[index]
+            if event & FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs) != 0 || path == projectsRoot {
+                needsRescan = true
+                break
+            }
+            if path == locksRoot || (path.hasPrefix(locksPrefix) && path.hasSuffix(".json")) {
+                locksChanged = true
+                continue
+            }
+            guard path.hasPrefix(projectsPrefix) else { continue }
+            let relativePath = path.dropFirst(projectsPrefix.count)
+            guard let separator = relativePath.firstIndex(of: "/") else {
+                if event & directoryChanges != 0 { needsRescan = true; break }
+                continue
+            }
+            let filename = relativePath[relativePath.index(after: separator)...]
+            if filename.hasSuffix(".jsonl"), !filename.contains("/") {
+                changedTranscripts.insert(path)
+            }
+        }
+        guard needsRescan || locksChanged || !changedTranscripts.isEmpty else { return }
+        if !needsRescan {
+            let updatedIDs = activeSessionIDs()
+            if updatedIDs.subtracting(activeIDs).contains(where: { sessions[$0] == nil }) {
+                needsRescan = true
+            }
+            activeIDs = updatedIDs
+        }
+        if needsRescan {
+            scanSessions()
+        } else {
+            let now = Date()
+            let previousSessions = sessions
+            for path in changedTranscripts {
+                let id = String((path as NSString).lastPathComponent.dropLast(6))
+                if let session = readSession(id: id, path: path, now: now, previous: previousSessions[id]) {
+                    sessions[id] = session
+                } else if sessions[id]?.jsonlPath == path {
+                    sessions.removeValue(forKey: id)
+                }
+            }
+            pruneSessions(now: now)
+        }
+        updateUI()
+        scheduleTick()
     }
 
     // MARK: - 会话扫描
 
     func scanSessions() {
         let fm = FileManager.default
-        let root = NSHomeDirectory() + "/.claude/projects"
-        guard let dirs = try? fm.contentsOfDirectory(atPath: root) else { return }
+        activeIDs = activeSessionIDs()
+        guard let dirs = try? fm.contentsOfDirectory(atPath: projectsRoot) else {
+            if !fm.fileExists(atPath: projectsRoot) { sessions.removeAll() }
+            return
+        }
         let now = Date()
         var found: [String: SessionState] = [:]
-        let activeIDs = activeSessionIDs()
-        for d in dirs {
-            let dirPath = root + "/" + d
+        for directory in dirs {
+            let dirPath = projectsRoot + "/" + directory
             guard let files = try? fm.contentsOfDirectory(atPath: dirPath) else { continue }
-            for f in files where f.hasSuffix(".jsonl") {
-                let path = dirPath + "/" + f
-                guard let attrs = try? fm.attributesOfItem(atPath: path),
-                      let m = attrs[.modificationDate] as? Date else { continue }
-                let id = String(f.dropLast(6))
-                // 仍开着的会话（有活动锁）不受 30 分钟窗口限制，可以一直保活
-                if now.timeIntervalSince(m) >= kSessionWindow && !activeIDs.contains(id) { continue }
-                if var old = sessions[id] {
-                    if old.mtime != m { refreshUserTurn(&old) }
-                    old.mtime = m
-                    found[id] = old
-                } else {
-                    let meta = readMeta(path: path)
-                    guard let cwd = meta.cwd else { continue }
-                    var s = SessionState(id: id, jsonlPath: path, cwd: cwd, version: meta.version ?? "",
-                                         title: meta.title ?? "会话 \(id.prefix(8))",
-                                         model: readTailModel(path: path) ?? "", mtime: m)
-                    s.userTurn = readLastUserTurn(path: path)
-                    if let saved = UserDefaults.standard.dictionary(forKey: "pingCount." + id),
-                       saved["turn"] as? String == (s.userTurn ?? "") {
-                        s.pingCount = saved["count"] as? Int ?? 0
-                        s.lastPingSucceeded = saved["succeeded"] as? Bool
-                    }
-                    s.lastNote = "待首次 ping"
-                    let key = "keep." + id
-                    if let v = UserDefaults.standard.object(forKey: key) as? Bool {
-                        s.selected = v
-                    } else {
-                        s.selected = true   // 默认勾选，手动取消才不 ping
-                    }
-                    found[id] = s
+            for filename in files where filename.hasSuffix(".jsonl") {
+                let id = String(filename.dropLast(6))
+                if let session = readSession(id: id, path: dirPath + "/" + filename, now: now, previous: sessions[id]) {
+                    found[id] = session
                 }
             }
         }
-        // 只保留仍可能活动的会话：有活动锁（Claude Code 正在运行）或 2 分钟内刚活跃
-        sessions = found.filter { id, s in
-            activeIDs.contains(id) || now.timeIntervalSince(s.mtime) < 120
+        sessions = found
+    }
+
+    func isListed(id: String, mtime: Date, now: Date) -> Bool {
+        activeIDs.contains(id) || now.timeIntervalSince(mtime) < min(kSessionWindow, 120)
+    }
+
+    func pruneSessions(now: Date) {
+        sessions = sessions.filter { id, session in isListed(id: id, mtime: session.mtime, now: now) }
+    }
+
+    func readSession(id: String, path: String, now: Date, previous: SessionState?) -> SessionState? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+              let mtime = attrs[.modificationDate] as? Date,
+              isListed(id: id, mtime: mtime, now: now) else { return nil }
+        if var session = previous {
+            let changed = session.jsonlPath != path || session.mtime != mtime
+            session.jsonlPath = path
+            if changed { refreshUserTurn(&session) }
+            session.mtime = mtime
+            return session
         }
+        let meta = readMeta(path: path)
+        guard let cwd = meta.cwd else { return nil }
+        var session = SessionState(id: id, jsonlPath: path, cwd: cwd, version: meta.version ?? "",
+                                   title: meta.title ?? "会话 \(id.prefix(8))",
+                                   model: readTailModel(path: path) ?? "", mtime: mtime)
+        session.userTurn = readLastUserTurn(path: path)
+        if let saved = UserDefaults.standard.dictionary(forKey: "pingCount." + id),
+           saved["turn"] as? String == (session.userTurn ?? "") {
+            session.pingCount = saved["count"] as? Int ?? 0
+            session.lastPingSucceeded = saved["succeeded"] as? Bool
+        }
+        session.selected = UserDefaults.standard.object(forKey: "keep." + id) as? Bool ?? true
+        return session
     }
 
     func activeSessionIDs() -> Set<String> {
         var ids = Set<String>()
-        let dir = NSHomeDirectory() + "/.claude/sessions"
+        let dir = locksRoot
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return ids }
         for f in files where f.hasSuffix(".json") {
             let path = dir + "/" + f
@@ -604,6 +728,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         let menu = NSMenu()
+        menu.delegate = self
         menu.autoenablesItems = false
         menuSummary = NSMenuItem(title: "尚未选择会话", action: nil, keyEquivalent: "")
         menuSummary.isEnabled = false
@@ -678,45 +803,79 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         w.contentView = content
         window = w
-        updateUI()
+        if let frame = windowFrame { w.setFrame(frame, display: false) }
     }
 
     @objc func showWindow() {
+        if window == nil { setupWindow() }
+        if window.isMiniaturized { window.deminiaturize(nil) }
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         updateUI()
+        updateRefreshTimer()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuIsOpen = true
+        updateUI()
+        updateRefreshTimer()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuIsOpen = false
+        updateRefreshTimer()
+    }
+
+    var isWindowVisible: Bool {
+        window?.isVisible == true && window?.isMiniaturized == false && !NSApp.isHidden
+    }
+
+    func updateRefreshTimer() {
+        guard isWindowVisible || menuIsOpen else {
+            refreshTimer?.invalidate()
+            refreshTimer = nil
+            return
+        }
+        guard refreshTimer == nil else { return }
+        let refresh = Timer(timeInterval: 1, target: self, selector: #selector(updateUI), userInfo: nil, repeats: true)
+        refreshTimer = refresh
+        RunLoop.main.add(refresh, forMode: .common)
     }
 
     @objc func updateUI() {
-        guard window != nil else { return }
-        let sorted = sessions.values.sorted {
+        let visible = isWindowVisible
+        let sorted = visible ? sessions.values.sorted {
             $0.mtime == $1.mtime ? $0.id < $1.id : $0.mtime > $1.mtime
-        }
-        let selected = sorted.filter(\.selected)
+        } : []
+        let selected = visible ? sorted.filter(\.selected) : sessions.values.filter(\.selected)
         let restoreCount = selected.filter(\.blocked).count
-        let keptIDs = Set(selected.lazy.filter(self.canKeepAlive).prefix(kMaxSessions).map(\.id))
-        summaryLabel.stringValue = "\(keptIDs.count) 个保活中 · 最多 \(kMaxSessions) 个"
+        let kept = selected.lazy.filter(canKeepAlive).prefix(kMaxSessions)
 
-        var summary = "\(keptIDs.count) 个会话保活中"
+        var summary = "\(kept.count) 个会话保活中"
         if restoreCount > 0 { summary += " · \(restoreCount) 个待恢复" }
         menuSummary.title = selected.isEmpty ? "尚未选择会话" : summary
         let result = lastPingSucceeded.map { $0 ? "成功" : "失败" } ?? "暂无记录"
-        let next = pingInFlight ? "发送中…" : nextAutoPingDate().map(countdown) ?? "暂无安排"
+        let nextPing = pingInFlight ? nil : nextAutoPingDate()
+        let next = pingInFlight ? "发送中…" : nextPing.map(countdown) ?? "暂无安排"
         let timing = "上次保活：\(result) · 下次：\(next)"
         if menuTiming.title != timing { menuTiming.title = timing }
-        let canPing = !keptIDs.isEmpty && !pingInFlight
+        let canPing = !kept.isEmpty && !pingInFlight
         menuPing.isEnabled = canPing
         menuPing.title = pingInFlight ? "保活中…" : "立即保活"
+        updateStatusIcon(needsRestore: restoreCount > 0)
+        setSleepBlock(pingInFlight || nextPing != nil)
+
+        guard visible else { return }
+        summaryLabel.stringValue = "\(kept.count) 个保活中 · 最多 \(kMaxSessions) 个"
         pingButton.isEnabled = canPing
         pingButton.title = menuPing.title
-        updateStatusIcon(needsRestore: restoreCount > 0)
 
+        let keptIDs = Set(kept.map(\.id))
         syncSessionRows(ids: sorted.prefix(10).map(\.id))
         for id in rowOrder {
             guard let session = sessions[id], let row = rows[id] else { continue }
             updateRow(row, session: session, keptAlive: keptIDs.contains(id))
         }
-        setSleepBlock(!keptIDs.isEmpty)
     }
 
     /// 有保活任务时阻止系统睡眠；没有则释放，不影响正常休眠
@@ -959,8 +1118,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         session.lastNote = "已恢复"
         sessions[id] = session
         log("恢复会话 \(id.prefix(8))")
-        if window.firstResponder === sender, let checkbox = rows[id]?.checkbox {
-            window.makeFirstResponder(checkbox)
+        if window?.firstResponder === sender, let checkbox = rows[id]?.checkbox {
+            window?.makeFirstResponder(checkbox)
         }
         updateUI()
         scheduleTick()
@@ -969,6 +1128,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func manualRefresh() {
         scanSessions()
         updateUI()
+        scheduleTick()
         log("手动刷新会话列表")
     }
 
